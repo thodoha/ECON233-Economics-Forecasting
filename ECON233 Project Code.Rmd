@@ -1,0 +1,282 @@
+---
+title: "ECON233 Project"
+author: "Tho Do, Yang Zhiyao, Soh Zhe Hong"
+date: "April 1, 2019"
+output:
+  html_document: default
+  word_document: default
+---
+We investigate the components of Singapore Domestic Export time series from Jan 1976 to Dec 2017. Then, we attempt to forecast it for the period of Jan 2018-Dec2018.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r echo=FALSE, message=FALSE}
+# This note uses the following libraries
+# find the path for Dropbox across machines
+library(jsonlite)
+file_name<-list.files(paste(Sys.getenv(x = "APPDATA"),"Dropbox", sep="/"), pattern = "*.json", full.names = T)
+if (length(file_name)==0){
+  file_name<-list.files(paste(Sys.getenv(x = "LOCALAPPDATA"),"Dropbox", sep="/"), pattern = "*.json", full.names = T)}
+
+dropbox_path<-fromJSON(txt=file_name)$personal
+dropbox_path<-dropbox_path$path
+
+# Import necessary packages
+library(tidyverse)
+library(forecast)
+library(ggfortify)
+library(gridExtra)
+library(grid)
+library(dynlm)
+library(xts)
+library(lubridate)
+library(urca)
+source(paste(dropbox_path,"\\ECON233\\","util.R",sep="")) # a R script containing all util functions from Prof's notes
+```
+
+## 1. Data Transformation
+
+Input data and transform data timeseries object.
+```{r echo=FALSE, message=FALSE}
+# read the data
+dx_data <- read_csv(paste(dropbox_path,"\\ECON233\\","dx_2017.csv",sep=""), col_names = FALSE)
+colnames(dx_data) <- c("Date", "DX")
+#dx_data$Date <- as.vector(dx_data$Date)
+
+# convert to xts
+#dx_xts <- xts(select(dx_data, -Date), order.by = as.yearmon(dx_data$Date, "%b-%y"))
+start_date <- as.yearmon(dx_data$Date[1],"%b-%y")
+end_date <- as.yearmon(dx_data$Date[nrow(dx_data)],"%b-%y")
+dx_ts <- ts(dx_data$DX, start = c(year(start_date), month(start_date)),
+                              end = c(year(end_date), month(end_date)),
+                              frequency = 12)
+```
+
+```{r message = FALSE}
+# transform to log 
+p1 <- autoplot(dx_ts) + xlab("Domestic Export Singapore") + theme(aspect.ratio=1/2)
+y <- ts(log(dx_ts), start = c(year(start_date), month(start_date)),
+        end = c(year(end_date), month(end_date)),
+        frequency = 12)
+p2 <- autoplot(y) + xlab("Domestic Export Singapore") + theme(aspect.ratio=1/2)
+grid.arrange(p1,p2, ncol = 2)
+correl(y)
+```
+
+Run the ADF and KPSS test to check stationary
+```{r message = FALSE}
+y %>%  ur.df(type="trend", selectlags="AIC") %>% summary()
+y %>% ur.kpss(type="tau", lags="short") %>% summary()
+```
+
+The series is not stationary from both tests. Hence we proceed to first difference it. We run similar tests on differenced series to ensure that it is now stationary.
+
+```{r message = FALSE}
+diff(y) %>% ur.df(type = "drift", selectlags = "AIC") %>% summary()
+diff(y) %>% ur.kpss(type ="mu", lags = "short") %>% summary()
+correl(diff(y))
+```
+
+
+PACF, we see 2 significant spikes at lag 1 and 2. Hence, we will fit an AR(2) component in our model.
+
+```{r echo=FALSE, message = FALSE}
+# Define trend and seasonals
+trendvar <- seq_along(y)
+seasonalvars <- seasonaldummy(y)
+trendseasvars = cbind(trendvar, seasonalvars)
+```
+
+We investigate seasonality to see whether it exists
+
+```{r message = FALSE}
+ggseasonplot(diff(y)) + theme(aspect.ratio = 1/2)
+ggsubseriesplot(diff(y)) + ggtitle("Monthly mean of DX") + theme(aspect.ratio = 1/2) # a seasonality component on March
+```
+
+There are seasonality at March every year. This suggests us to try either SARIMA or ARIMA with seasonal dummies.
+
+## 2. Model Selection
+
+We run different models and pick the one with smallest BIC.
+
+```{r message = FALSE}
+fit1 <- Arima(y, order=c(2,1,0),
+              include.constant = T,
+              lambda=NULL) # box-cox transformation, lambda=0 is log-transformatio
+summary(fit1)
+checkresiduals(fit1)
+```
+
+
+```{r message = FALSE}
+fit2 <- Arima(y, order=c(2,1,0),
+              seasonal=c(2,0,0),
+              include.constant = T,
+              lambda=NULL) # box-cox transformation, lambda=0 is log-transformation
+summary(fit2)
+checkresiduals(fit2)
+```
+
+
+```{r message = FALSE}
+fit3 <- Arima(y, order=c(2,1,0),
+              xreg=seasonalvars,
+              include.constant = T,
+              lambda=NULL) # box-cox transformation, lambda=0 is log-transformation
+summary(fit3)
+checkresiduals(fit3)
+```
+
+```{r message = FALSE}
+fit4 <- Arima(y, order=c(2,1,0),
+              seasonal=c(2,0,0),
+              xreg=seasonalvars,
+              include.constant = T,
+              lambda=NULL) # box-cox transformation, lambda=0 is log-transformation
+summary(fit4)
+checkresiduals(fit4)
+```
+
+In conclusion, we pick ARIMA(2,1,0) with seasonal dummies as our chosen model since it has lowest BIC compared to other.
+
+```{r message = FALSE}
+fit_chosen <- Arima(y, order=c(2,1,0),
+              xreg=seasonalvars,
+              include.constant = T,
+              lambda=NULL) # box-cox transformation, lambda=0 is log-transformation
+summary(fit_chosen)
+```
+
+
+## 3. Forecasting 2013- 2017 1 step ahead in sample
+
+We test this model on a somewhat validation set to see its performance. Note that this is overfitting since the chosen model is built on this data.
+
+```{r message=FALSE}
+no_fcst_mths <- length(window(y, start = c(2013,1), end = c(2017,12)))
+no_remain_months <- length(y) - no_fcst_mths
+fcst1step <-ts(matrix(rep(NA,no_fcst_mths*3),ncol=3), start=c(2013,1), frequency=12) # to store forecasts
+colnames(fcst1step) <- c("mean", "lower", "upper")
+
+for (i in 1:no_fcst_mths){
+
+  temp_mdl <- Arima(y[1:(no_remain_months+i-1)], 
+                order = c(2,1,0),
+                xreg = seasonalvars[1:(no_remain_months+i-1),],
+                include.constant = T,
+                biasadj = T,
+                lambda = NULL)
+
+
+  temp <- forecast(temp_mdl, h=1, xreg=matrix(seasonalvars[(no_remain_months+i):(no_remain_months+i),],nrow = 1))
+  fcst1step[i,]<-cbind(temp$mean, temp$lower[,"80%"], temp$upper[,"80%"])
+
+}
+
+ts.plot <- ts.union(Actual=window(y, start = c(2010,1)), fcst1step)
+autoplot(ts.plot) +
+  scale_color_manual(values=rep("black", 4)) +
+  ylab("") + xlab("") +
+  aes(linetype=series) +
+  scale_size_manual(values = c(0.5, 2, 0.75)) +
+  scale_linetype_manual(values=c("solid", "dashed", rep("dotted",2))) +
+  ts_thm + theme(legend.position="none") + ggtitle("Forecast 1-step ahead for 2013-2017")
+
+```
+
+Evaluate R-squared and RMSE on this period
+
+```{r message=FALSE}
+f1err <- ts.union(Actual=window(y,start=c(2013,1)),Fcst=fcst1step[,1])
+sse <- sum((f1err[,"Actual"]-f1err[,"Fcst"])^2)
+sst <- sum((f1err[,"Actual"]-mean(f1err[,"Actual"]))^2)
+OOSR2 <- 1-sse/sst
+print(paste0("Out-of-sample RMSE is ",as.character(round(sqrt(sse/length(f1err)),2))))
+print(paste0("Out-of-sample R-sqr is ",as.character(round(OOSR2,2))))
+```
+It is not surprising that the forecast is quite good.
+
+## 4. Forecasting 2018 out of sample  
+
+Forecast 12 period ahead
+```{r message = FALSE}
+fcst <- forecast(fit_chosen, h=12, xreg = seasonalvars) # forecast 1 to 28 steps (1 years x 12 months) ahead
+actual_data <- read_csv(paste(dropbox_path,"\\ECON233\\","dx_2018.csv",sep=""), col_names = FALSE)
+colnames(actual_data) <- c("Date", "DX")
+actual_data$DX <- log(actual_data$DX)
+dx_actual_ts <- ts(actual_data$DX, start = c(1976,1), frequency = 12)
+dx_os_ts <- window(dx_actual_ts, start = c(2018, 1), end = c(2018,12), frequecy = 12)
+
+autoplot(ts.union(window(dx_actual_ts, start = c(2015,1), end = c(2018,12)),
+                  window(fcst$mean, start = c(2015,1), end = c(2018,12)),
+                  window(fcst$lower, start = c(2015,1), end = c(2018,12)),
+                  window(fcst$upper, start = c(2015,1), end = c(2018,12)))) +
+  scale_color_manual(values=rep("black", 6)) +
+  ylab("") + xlab("") +
+  aes(linetype=series) +
+  scale_size_manual(values = c(0.5, 2, 0.75)) +
+  scale_linetype_manual(values=c("solid", "dashed", rep("dotted",4))) +
+  ts_thm + theme(legend.position="none") + ggtitle("Forecast 12-period ahead for 2018")
+
+```
+
+Evaluate forecast on real data for 2018
+
+```{r message=FALSE}
+f2err <- ts.union(Actual=window(dx_os_ts,start=c(2018,1)),
+                  Fcst=window(fcst$mean, start = c(2018,1), end = c(2018,12)))
+sse <- sum((f2err[,"Actual"]-f2err[,"Fcst"])^2)
+sst <- sum((f2err[,"Actual"]-mean(f2err[,"Actual"]))^2)
+OOSR2 <- 1-sse/sst
+print(paste0("Out-of-sample RMSE is ",as.character(round(sqrt(sse/12),2))))
+print(paste0("Out-of-sample R-sqr is ",as.character(round(OOSR2,2))))
+```
+
+Forecast 1-step ahead for the model during 2018.
+
+```{r message=FALSE}
+seasonalvars2 <- seasonaldummy(dx_actual_ts)
+no_fcst_mths <- length(window(dx_actual_ts, start = c(2018,1), end = c(2018,12)))
+no_remain_months <- length(dx_actual_ts) - no_fcst_mths # remove 2 months of jan and feb 2019
+fcst1step_3 <-ts(matrix(rep(NA,no_fcst_mths*3),ncol=3), start=c(2018,1), frequency=12) # to store forecasts
+colnames(fcst1step_3) <- c("mean", "lower", "upper")
+
+for (i in 1:no_fcst_mths){
+  
+  temp_mdl <- Arima(dx_actual_ts[1:(no_remain_months+i-1)], 
+                     order = c(2,1,0),
+                     xreg = seasonalvars2[1:(no_remain_months+i-1),],
+                     include.constant = T,
+                     biasadj = T,
+                     lambda = NULL)
+  
+  
+  
+  temp <- forecast(temp_mdl, h=1, xreg=matrix(seasonalvars2[(no_remain_months+i):(no_remain_months+i),],nrow = 1),
+                   biasadj = T, lambda = NULL)
+  fcst1step_3[i,]<-cbind(temp$mean, temp$lower[,"80%"], temp$upper[,"80%"])
+  
+}
+
+ts.plot <- ts.union(Actual=window(dx_actual_ts, start = c(2015,1)), fcst1step_3)
+autoplot(ts.plot) +
+  scale_color_manual(values=rep("black", 4)) +
+  ylab("") + xlab("") +
+  aes(linetype=series) +
+  scale_size_manual(values = c(0.5, 2, 0.75)) +
+  scale_linetype_manual(values=c("solid", "dashed", rep("dotted",2))) +
+  ts_thm + theme(legend.position="none") + ggtitle("Forecast 1-step ahead for 2018")
+
+```
+
+Evaluate the accuracy and R-squared for this period
+```{r message=FALSE}
+f1err_2 <- ts.union(Actual=window(dx_actual_ts,start=c(2018,1)),Fcst=fcst1step_3[,1])
+sse <- sum((f1err_2[,"Actual"]-f1err_2[,"Fcst"])^2)
+sst <- sum((f1err_2[,"Actual"]-mean(f1err_2[,"Actual"]))^2)
+OOSR2 <- 1-sse/sst
+print(paste0("Out-of-sample RMSE is ",as.character(round(sqrt(sse/length(f1err_2)),2))))
+print(paste0("Out-of-sample R-sqr is ",as.character(round(OOSR2,2))))
+```
